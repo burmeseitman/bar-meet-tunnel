@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -77,11 +78,19 @@ func main() {
 
 // handleAgentRegistration handles the persistent HTTP/2 connection from the agent
 func (g *Gateway) handleAgentRegistration(w http.ResponseWriter, r *http.Request) {
+	// Security: Validate subdomain format
+	validSubdomain := regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
 	agentID := r.Header.Get("X-Agent-ID")
 	subdomain := r.Header.Get("X-Subdomain")
 
 	if agentID == "" || subdomain == "" {
-		http.Error(w, "Missing Agent-ID or Subdomain", 400)
+		http.Error(w, "Missing credentials", http.StatusUnauthorized)
+		return
+	}
+
+	if !validSubdomain.MatchString(subdomain) || len(agentID) > 64 {
+		http.Error(w, "Invalid input format", http.StatusBadRequest)
 		return
 	}
 
@@ -117,7 +126,13 @@ func (g *Gateway) handlePublicRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid host", 400)
 		return
 	}
+	validSubdomain := regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	subdomain := parts[0]
+
+	if !validSubdomain.MatchString(subdomain) {
+		http.Error(w, "Access Denied: Invalid Host", http.StatusForbidden)
+		return
+	}
 
 	// Lookup agentID in Redis
 	ctx := context.Background()

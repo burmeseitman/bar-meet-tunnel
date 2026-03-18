@@ -8,8 +8,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"strings"
 	"syscall"
 	"time"
 
@@ -90,13 +93,39 @@ func (a *Agent) maintainConnection() {
 // forwardToLocal function is where we handle incoming proxied requests
 // and forward them to localhost.
 func (a *Agent) forwardToLocal(w http.ResponseWriter, r *http.Request) {
-	targetURL := a.LocalHost + r.URL.Path
+	// Security: Sanitize path to prevent traversal
+	// Use path.Clean to collapse any ".." etc.
+	sanitizedPath := path.Clean(r.URL.Path)
+	if !strings.HasPrefix(sanitizedPath, "/") {
+		sanitizedPath = "/" + sanitizedPath
+	}
+
+	u, err := url.Parse(a.LocalHost)
+	if err != nil {
+		http.Error(w, "Proxy configuration error", 500)
+		return
+	}
+	u.Path = path.Join(u.Path, sanitizedPath)
+	u.RawQuery = r.URL.RawQuery
+	targetURL := u.String()
+
 	log.Printf("🔄 Forwarding %s -> %s\n", r.URL.Path, targetURL)
 
 	// Proxy the request to localhost
-	localReq, _ := http.NewRequest(r.Method, targetURL, r.Body)
-	// Copy headers...
-	
+	localReq, err := http.NewRequest(r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "Request construction failed", 500)
+		return
+	}
+
+	// Copy essential headers only
+	for _, h := range []string{"Content-Type", "Accept", "Authorization"} {
+		if val := r.Header.Get(h); val != "" {
+			localReq.Header.Set(h, val)
+		}
+	}
+	localReq.Header.Set("X-Forwarded-For", r.RemoteAddr)
+
 	localResp, err := http.DefaultClient.Do(localReq)
 	if err != nil {
 		log.Printf("❌ Failed to reach local service: %v\n", err)
