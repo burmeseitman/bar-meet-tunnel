@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bar Meet Tunnel</title>
+  <style>
+    :root {
+      --bg: #0d1321;
+      --bg-soft: #182033;
+      --panel: rgba(13, 19, 33, 0.86);
+      --panel-strong: rgba(24, 32, 51, 0.95);
+      --border: rgba(159, 181, 214, 0.18);
+      --text: #edf4ff;
+      --muted: #9fb5d6;
+      --accent: #ff8a3d;
+      --accent-soft: #ffd6ba;
+      --green: #28c77e;
+      --red: #ff5d73;
+      --yellow: #ffcf5c;
+      --shadow: 0 30px 80px rgba(0, 0, 0, 0.35);
+      --mono: "SFMono-Regular", "SF Mono", ui-monospace, Menlo, monospace;
+      --sans: "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(255, 138, 61, 0.28), transparent 26%),
+        radial-gradient(circle at top right, rgba(40, 199, 126, 0.18), transparent 18%),
+        linear-gradient(135deg, #09111c 0%, #0d1321 38%, #121d31 100%);
+    }
+
+    .shell {
+      width: min(1500px, calc(100vw - 32px));
+      margin: 24px auto;
+      display: grid;
+      gap: 18px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 2fr 1fr;
+      padding: 24px;
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: linear-gradient(160deg, rgba(24, 32, 51, 0.96), rgba(13, 19, 33, 0.88));
+      box-shadow: var(--shadow);
+    }
+
+    .hero h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 4vw, 3.2rem);
+      letter-spacing: -0.04em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 60ch;
+      line-height: 1.5;
+    }
+
+    .hero-stats {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .stat {
+      padding: 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+    }
+
+    .stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+
+    .stat strong {
+      display: block;
+      margin-top: 10px;
+      font-size: 1.8rem;
+      letter-spacing: -0.04em;
+    }
+
+    .workspace {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: 320px 1.3fr 1fr;
+      align-items: start;
+    }
+
+    .panel {
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 1rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .panel-body {
+      padding: 18px 20px 20px;
+    }
+
+    .pill {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .tunnel-list,
+    .request-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .tunnel-card,
+    .request-card {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.025);
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease;
+    }
+
+    .tunnel-card:hover,
+    .request-card:hover,
+    .tunnel-card.active,
+    .request-card.active {
+      transform: translateY(-1px);
+      border-color: rgba(255, 138, 61, 0.52);
+      background: rgba(255, 138, 61, 0.08);
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .tunnel-card strong,
+    .request-card strong {
+      font-size: 1rem;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .mono {
+      font-family: var(--mono);
+      word-break: break-word;
+    }
+
+    .request-method {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      color: var(--accent-soft);
+      letter-spacing: 0.08em;
+    }
+
+    .status {
+      min-width: 56px;
+      text-align: center;
+      padding: 5px 8px;
+      border-radius: 999px;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .status.ok {
+      color: var(--green);
+      border-color: rgba(40, 199, 126, 0.32);
+      background: rgba(40, 199, 126, 0.08);
+    }
+
+    .status.warn {
+      color: var(--yellow);
+      border-color: rgba(255, 207, 92, 0.32);
+      background: rgba(255, 207, 92, 0.08);
+    }
+
+    .status.err {
+      color: var(--red);
+      border-color: rgba(255, 93, 115, 0.35);
+      background: rgba(255, 93, 115, 0.08);
+    }
+
+    .details {
+      display: grid;
+      gap: 14px;
+    }
+
+    .details-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .details-card {
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .details-card span {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    pre {
+      margin: 0;
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--accent-soft);
+      font-family: var(--mono);
+      font-size: 0.86rem;
+      line-height: 1.45;
+      overflow: auto;
+      max-height: 280px;
+      white-space: pre-wrap;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+      color: #0c1320;
+      background: linear-gradient(135deg, #ffcf5c, #ff8a3d);
+    }
+
+    .button.secondary {
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+    }
+
+    .empty {
+      padding: 18px;
+      border-radius: 18px;
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    @media (max-width: 1100px) {
+      .hero,
+      .workspace {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero panel">
+      <div>
+        <div class="pill">Embedded Web UI</div>
+        <h1>Bar Meet Tunnel Control Room</h1>
+        <p>Live tunnel registry, request inspection, and one-click replay from the gateway control plane.</p>
+      </div>
+      <div class="hero-stats">
+        <article class="stat">
+          <span>Active Tunnels</span>
+          <strong id="activeCount">0</strong>
+        </article>
+        <article class="stat">
+          <span>Captured Requests</span>
+          <strong id="requestCount">0</strong>
+        </article>
+        <article class="stat">
+          <span>Selected Tunnel</span>
+          <strong id="selectedTunnel">All</strong>
+        </article>
+        <article class="stat">
+          <span>Last Refresh</span>
+          <strong id="lastRefresh">-</strong>
+        </article>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <section class="panel">
+        <header class="panel-header">
+          <h2>Active Tunnels</h2>
+          <span class="pill" id="tunnelBadge">0 connected</span>
+        </header>
+        <div class="panel-body">
+          <div class="toolbar">
+            <button class="button secondary" id="clearTunnelFilter">Show All</button>
+          </div>
+          <div class="tunnel-list" id="tunnelList"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header class="panel-header">
+          <h2>Traffic Logs</h2>
+          <span class="pill" id="requestBadge">0 captured</span>
+        </header>
+        <div class="panel-body">
+          <div class="request-list" id="requestList"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header class="panel-header">
+          <h2>Inspector</h2>
+          <div class="toolbar">
+            <button class="button" id="replayButton" disabled>Replay Request</button>
+          </div>
+        </header>
+        <div class="panel-body">
+          <div id="details" class="details">
+            <div class="empty">Select a traffic entry to inspect request and response data.</div>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      tunnels: [],
+      requests: [],
+      selectedRequestId: null,
+      selectedTunnel: "",
+    };
+
+    const tunnelList = document.getElementById("tunnelList");
+    const requestList = document.getElementById("requestList");
+    const details = document.getElementById("details");
+    const replayButton = document.getElementById("replayButton");
+
+    document.getElementById("clearTunnelFilter").addEventListener("click", () => {
+      state.selectedTunnel = "";
+      renderTunnels();
+      refresh();
+    });
+
+    replayButton.addEventListener("click", async () => {
+      if (!state.selectedRequestId) {
+        return;
+      }
+      replayButton.disabled = true;
+      try {
+        const response = await fetch(`/api/requests/${state.selectedRequestId}/replay`, { method: "POST" });
+        if (!response.ok) {
+          const text = await response.text();
+          alert(text || "Replay failed");
+          return;
+        }
+        const record = await response.json();
+        state.selectedRequestId = record.id;
+        await refresh();
+      } catch (error) {
+        alert(error.message || "Replay failed");
+      } finally {
+        replayButton.disabled = false;
+      }
+    });
+
+    function statusClass(statusCode, error) {
+      if (error || statusCode >= 500) return "err";
+      if (statusCode >= 400) return "warn";
+      return "ok";
+    }
+
+    function formatTime(value) {
+      if (!value) return "-";
+      return new Intl.DateTimeFormat(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }).format(new Date(value));
+    }
+
+    function formatNumber(value) {
+      return new Intl.NumberFormat().format(value || 0);
+    }
+
+    function formatBytes(value) {
+      if (!value) return "0 B";
+      const units = ["B", "KB", "MB", "GB"];
+      let unitIndex = 0;
+      let size = value;
+      while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+      }
+      return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    function safeText(body) {
+      if (!body || !body.content) return "";
+      if (body.encoding === "base64") {
+        return `[base64] ${body.content}`;
+      }
+      return body.truncated ? `${body.content}\n\n[truncated]` : body.content;
+    }
+
+    function renderTunnels() {
+      document.getElementById("activeCount").textContent = formatNumber(state.tunnels.length);
+      document.getElementById("selectedTunnel").textContent = state.selectedTunnel || "All";
+      document.getElementById("tunnelBadge").textContent = `${state.tunnels.length} connected`;
+
+      if (!state.tunnels.length) {
+        tunnelList.innerHTML = '<div class="empty">No agents connected.</div>';
+        return;
+      }
+
+      tunnelList.innerHTML = state.tunnels.map((tunnel) => `
+        <button class="tunnel-card ${state.selectedTunnel === tunnel.subdomain ? "active" : ""}" data-tunnel="${escapeAttr(tunnel.subdomain)}">
+          <div class="row">
+            <strong>${escapeHtml(tunnel.subdomain)}</strong>
+            <span class="status ok">LIVE</span>
+          </div>
+          <p class="muted mono">${escapeHtml(tunnel.local_host)}</p>
+          <div class="row muted">
+            <span>${formatNumber(tunnel.request_count)} req</span>
+            <span>${formatBytes(tunnel.bytes_out)} out</span>
+          </div>
+        </button>
+      `).join("");
+
+      [...tunnelList.querySelectorAll("[data-tunnel]")].forEach((button) => {
+        button.addEventListener("click", () => {
+          state.selectedTunnel = button.dataset.tunnel || "";
+          renderTunnels();
+          refresh();
+        });
+      });
+    }
+
+    function renderRequests() {
+      document.getElementById("requestCount").textContent = formatNumber(state.requests.length);
+      document.getElementById("requestBadge").textContent = `${state.requests.length} captured`;
+
+      if (!state.requests.length) {
+        requestList.innerHTML = '<div class="empty">No traffic captured yet.</div>';
+        details.innerHTML = '<div class="empty">Select a traffic entry to inspect request and response data.</div>';
+        state.selectedRequestId = null;
+        replayButton.disabled = true;
+        return;
+      }
+
+      if (!state.selectedRequestId || !state.requests.some((entry) => entry.id === state.selectedRequestId)) {
+        state.selectedRequestId = state.requests[0].id;
+      }
+
+      requestList.innerHTML = state.requests.map((entry) => {
+        const query = entry.raw_query ? `?${entry.raw_query}` : "";
+        const replay = entry.replay_of ? `<span class="pill">Replay of ${escapeHtml(entry.replay_of)}</span>` : "";
+        return `
+          <button class="request-card ${state.selectedRequestId === entry.id ? "active" : ""}" data-request="${escapeAttr(entry.id)}">
+            <div class="row">
+              <div class="request-method">${escapeHtml(entry.method)}</div>
+              <span class="status ${statusClass(entry.status_code, entry.error)}">${entry.status_code || "ERR"}</span>
+            </div>
+            <strong class="mono">${escapeHtml(entry.tunnel)}${escapeHtml(entry.path)}${escapeHtml(query)}</strong>
+            <div class="row muted">
+              <span>${formatTime(entry.started_at)}</span>
+              <span>${entry.duration_ms} ms</span>
+            </div>
+            ${replay}
+          </button>
+        `;
+      }).join("");
+
+      [...requestList.querySelectorAll("[data-request]")].forEach((button) => {
+        button.addEventListener("click", () => {
+          state.selectedRequestId = button.dataset.request;
+          renderRequests();
+          renderDetails();
+        });
+      });
+
+      renderDetails();
+    }
+
+    function renderDetails() {
+      const entry = state.requests.find((item) => item.id === state.selectedRequestId);
+      replayButton.disabled = !entry;
+
+      if (!entry) {
+        details.innerHTML = '<div class="empty">Select a traffic entry to inspect request and response data.</div>';
+        return;
+      }
+
+      const query = entry.raw_query ? `?${entry.raw_query}` : "";
+      details.innerHTML = `
+        <div class="details-grid">
+          <div class="details-card">
+            <span>Request</span>
+            <div class="mono">${escapeHtml(entry.method)} ${escapeHtml(entry.path)}${escapeHtml(query)}</div>
+          </div>
+          <div class="details-card">
+            <span>Status</span>
+            <div class="mono">${entry.status_code} ${entry.error ? `(${escapeHtml(entry.error)})` : ""}</div>
+          </div>
+          <div class="details-card">
+            <span>Tunnel</span>
+            <div class="mono">${escapeHtml(entry.tunnel)}</div>
+          </div>
+          <div class="details-card">
+            <span>Started</span>
+            <div class="mono">${new Date(entry.started_at).toLocaleString()}</div>
+          </div>
+        </div>
+        <div>
+          <p class="muted">Request headers</p>
+          <pre>${escapeHtml(JSON.stringify(entry.request_headers || {}, null, 2))}</pre>
+        </div>
+        <div>
+          <p class="muted">Request body</p>
+          <pre>${escapeHtml(safeText(entry.request_body))}</pre>
+        </div>
+        <div>
+          <p class="muted">Response headers</p>
+          <pre>${escapeHtml(JSON.stringify(entry.response_headers || {}, null, 2))}</pre>
+        </div>
+        <div>
+          <p class="muted">Response body</p>
+          <pre>${escapeHtml(safeText(entry.response_body))}</pre>
+        </div>
+      `;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replaceAll('"', "&quot;");
+    }
+
+    async function refresh() {
+      const [tunnelsResponse, requestsResponse] = await Promise.all([
+        fetch("/api/tunnels"),
+        fetch(`/api/requests${state.selectedTunnel ? `?tunnel=${encodeURIComponent(state.selectedTunnel)}` : ""}`),
+      ]);
+
+      state.tunnels = tunnelsResponse.ok ? await tunnelsResponse.json() : [];
+      state.requests = requestsResponse.ok ? await requestsResponse.json() : [];
+      document.getElementById("lastRefresh").textContent = formatTime(new Date().toISOString());
+
+      renderTunnels();
+      renderRequests();
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

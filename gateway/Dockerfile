@@ -1,9 +1,9 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
-COPY go.mod ./
-# RUN go mod download # (Need to go mod tidy first locally)
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
 RUN go build -o /bar-meet-gateway ./gateway/main.go

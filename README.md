@@ -1,79 +1,235 @@
 <p align="center">
-  <img src="logo.png" alt="Bar Meet Tunnel Logo" width="300px">
+  <img src="logo.png" alt="Bar Meet Tunnel Logo" width="300">
 </p>
 
-# 🌌 Bar Meet Tunnel
+# Bar Meet Tunnel
 
-<p align="center">
-  <img src="https://img.shields.io/badge/go-%2300ADD8.svg?style=for-the-badge&logo=go&logoColor=white" alt="Go">
-  <img src="https://img.shields.io/badge/redis-%23DD0031.svg?style=for-the-badge&logo=redis&logoColor=white" alt="Redis">
-  <img src="https://img.shields.io/badge/nginx-%23009639.svg?style=for-the-badge&logo=nginx&logoColor=white" alt="Nginx">
-  <img src="https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
-  <br>
-  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License MIT">
-</p>
+Ngrok-style HTTP tunnel in Go with an embedded control UI.
 
-**Pro-Level HTTP/2 Tunneling.** Create and access your own secure tunnel, built from scratch with Go, Redis, and Nginx.
+## What It Does
 
----
+- Public HTTP requests route through the gateway to a connected agent over WebSocket.
+- The agent forwards each request to your local service and sends the response back to the gateway.
+- The control server exposes a Web UI for:
+  - active tunnels
+  - captured traffic logs
+  - request replay
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph LR
-    User([🌍 Public User]) --> Nginx[🛡️ Nginx TLS/H2]
-    Nginx --> Gateway[🏗️ Gateway Server]
-    Gateway <--> Redis[(💾 Redis Cache)]
-    Gateway <--> Agent[🕵️ Client Agent]
-    Agent --> Local[💻 Your Local Service]
+    User([Public User]) --> GatewayPublic[Gateway Public Port]
+    GatewayPublic --> GatewayControl[Gateway Control Plane]
+    GatewayControl <--> Agent[Local Agent]
+    Agent --> Local[Local HTTP Service]
+    GatewayControl --> UI[Embedded Web UI]
+    GatewayControl <--> Redis[(Redis Optional)]
 ```
 
-- **Gateway Server**: Core logic for routing public traffic to agents.
-- **Client Agent**: Connects your local server to the Gateway.
-- **Redis Session Mapping**: Fast, scalable mapping of `subdomain -> agent_id`.
-- **Nginx & TLS**: Professional-grade security with HTTP/2 termination.
+## Default Ports
 
-## 🚀 Getting Started
+- Public traffic: `:80`
+- Control plane and Web UI: `:9000`
 
-### 1. Prerequisites
-- Docker & Docker Compose
-- Go 1.25.0+ (Latest security patched)
+## Deploy
 
-### 2. Launch Infrastructure
+### Option 1: Local deploy
+
+Run the gateway:
+
 ```bash
-# In the project root:
-docker-compose up -d
+go run ./gateway
 ```
-This starts the **Gateway**, **Redis**, and **Nginx**.
 
-### 3. Run the Agent (Local Machine)
-Connect your local service (default: `localhost:8080`) to the tunnel:
+Run the agent on the machine that can reach your local app:
+
 ```bash
-cd agent
-go run main.go
+AGENT_ID=my-agent \
+SUBDOMAIN=bar-meet-app \
+LOCAL_HOST=http://127.0.0.1:8080 \
+GATEWAY_WS=ws://127.0.0.1:9000/agent/connect \
+go run ./agent
 ```
 
-### 🌍 Access Your Tunnel
-Requests to `bar-meet-app.tunnel.com` will now stream directly to your local machine!
+Open the control UI:
 
----
+```text
+http://127.0.0.1:9000/ui
+```
 
-## 💎 Features
-- ✅ **HTTP/2 Multiplexing**: High efficiency, low latency through persistent connections.
-- ✅ **Secure TLS**: Nginx-powered SSL termination with modern protocols.
-- ✅ **Redis Backed**: Persistent and scalable session management with automated heartbeat.
-- ✅ **Pro-Level Standards**: Architecture designed for scalability and clean code.
+### Option 2: Docker deploy
 
-## 🛡️ Security Audit
-This project has been audited for common tunnel vulnerabilities:
-- **Regex Subdomain Validation**: Prevents host-header/subdomain injection.
-- **Path Traversal Protection**: Uses `path.Clean()` to prevent escaping local service boundaries.
-- **SSRF Mitigation**: Strict proxy URL construction using `net/url`.
-- **Dependency Guard**: Regularly updated with latest security patches for `x/net` and `x/sys`.
+Start the infrastructure:
 
----
+```bash
+docker compose up --build
+```
 
-## 📄 License
-This project is licensed under the [MIT License](LICENSE).
+What starts:
 
-"Secure Local Access, Redefined."
+- `gateway` on `:80` and `:9000`
+- `redis` on `:6379`
+- `nginx` on `:443`
+
+Important notes:
+
+- `nginx` requires valid cert files in `./certs/fullchain.pem` and `./certs/privkey.pem`
+- the agent still runs outside the Compose stack unless you add it as another service
+- if you only want the gateway and Redis, you can run `docker compose up --build gateway redis`
+
+### Production deployment notes
+
+- Point your wildcard DNS, for example `*.tunnel.example.com`, to the gateway host.
+- Put TLS in front of the public port with nginx, Caddy, or a load balancer.
+- Expose the control port only to trusted users. The current Web UI and API do not have authentication yet.
+- Redis is optional in the current single-node setup, but useful if you want tunnel registration state outside process memory.
+
+## Test
+
+### 1. Start a local HTTP app
+
+```bash
+python3 - <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length else b""
+        payload = {
+            "method": self.command,
+            "path": self.path,
+            "body": body.decode("utf-8", "replace"),
+            "forwarded_host": self.headers.get("X-Forwarded-Host"),
+            "replay_of": self.headers.get("X-Bar-Meet-Replay-Of"),
+        }
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = _send
+    do_POST = _send
+
+HTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+PY
+```
+
+Or run your own app on `http://127.0.0.1:8080`.
+
+### 2. Start the gateway
+
+```bash
+go run ./gateway
+```
+
+### 3. Start the agent
+
+```bash
+AGENT_ID=my-agent \
+SUBDOMAIN=bar-meet-app \
+LOCAL_HOST=http://127.0.0.1:8080 \
+GATEWAY_WS=ws://127.0.0.1:9000/agent/connect \
+go run ./agent
+```
+
+### 4. Send traffic through the tunnel
+
+```bash
+curl -H 'Host: bar-meet-app.tunnel.com' http://127.0.0.1/hello
+```
+
+If you want to test a POST request:
+
+```bash
+curl \
+  -X POST \
+  -H 'Host: bar-meet-app.tunnel.com' \
+  -H 'Content-Type: application/json' \
+  -d '{"ping":"pong"}' \
+  http://127.0.0.1/api/test
+```
+
+### 5. Inspect in the Web UI
+
+Open:
+
+```text
+http://127.0.0.1:9000/ui
+```
+
+You should see:
+
+- the active tunnel in the left panel
+- captured traffic logs in the center panel
+- request and response details in the inspector
+
+### 6. Replay a request
+
+Use either the replay button in the UI or the API directly:
+
+```bash
+curl -X POST http://127.0.0.1:9000/api/requests/req-1/replay
+```
+
+This creates a new traffic record linked to the original request through `replay_of`.
+
+### 7. Verify the API directly
+
+List active tunnels:
+
+```bash
+curl http://127.0.0.1:9000/api/tunnels
+```
+
+List captured requests:
+
+```bash
+curl http://127.0.0.1:9000/api/requests
+```
+
+Fetch one request:
+
+```bash
+curl http://127.0.0.1:9000/api/requests/req-1
+```
+
+### 8. Run build and test checks
+
+```bash
+go test ./...
+go build ./...
+```
+
+## Environment Variables
+
+Gateway:
+
+- `PUBLIC_ADDR` default `:80`
+- `CONTROL_ADDR` default `:9000`
+- `REDIS_URL` default `localhost:6379`
+
+Agent:
+
+- `AGENT_ID`
+- `SUBDOMAIN`
+- `LOCAL_HOST`
+- `GATEWAY_WS`
+
+## Notes
+
+- Redis is optional for the current single-node setup. If Redis is unavailable, the gateway falls back to in-memory session tracking.
+- Traffic capture is currently in-memory only. Restarting the gateway clears the request history.
+- Request and response bodies are capped at `10 MiB` per exchange.
+
+## Docker
+
+The gateway Dockerfile builds the current Go codebase. The included `docker-compose.yml` still wires Redis and nginx, but you need valid TLS certs under `./certs` before nginx can start.
+
+## License
+
+MIT
