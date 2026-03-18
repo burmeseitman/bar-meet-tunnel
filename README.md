@@ -1,235 +1,155 @@
 <p align="center">
-  <img src="logo.png" alt="Bar Meet Tunnel Logo" width="300">
+  <img src="logo.png" alt="Bar Meet Tunnel Logo" width="240">
 </p>
 
-# Bar Meet Tunnel
+# 🚀 Bar Meet Tunnel
 
-Ngrok-style HTTP tunnel in Go with an embedded control UI.
+A high-performance, **Ngrok-style** HTTP tunnel built in Go with an integrated **Traffic Inspector UI**.
 
-## What It Does
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- Public HTTP requests route through the gateway to a connected agent over WebSocket.
-- The agent forwards each request to your local service and sends the response back to the gateway.
-- The control server exposes a Web UI for:
-  - active tunnels
-  - captured traffic logs
-  - request replay
+## ✨ Core Features
 
-## Architecture
+- **⚡ Instant Public Access**: Tunnel local HTTP services to the internet securely.
+- **🛡️ Built-in Control Plane**: A centralized gateway to manage active tunnels.
+- **👁️ Traffic Inspector**: Real-time logging and deep inspection of request/response bodies.
+- **🔄 Request Replay**: One-click replay of captured traffic for rapid testing and debugging.
+- **📦 Multi-Environment**: Runs as a binary or within Docker with Redis support.
+- **🔒 Optional Persistence**: Seamlessly switches between in-memory and Redis for tunnel state management.
+
+---
+
+## 🏗️ Architecture
 
 ```mermaid
 graph LR
-    User([Public User]) --> GatewayPublic[Gateway Public Port]
-    GatewayPublic --> GatewayControl[Gateway Control Plane]
-    GatewayControl <--> Agent[Local Agent]
-    Agent --> Local[Local HTTP Service]
-    GatewayControl --> UI[Embedded Web UI]
-    GatewayControl <--> Redis[(Redis Optional)]
+    User([Public User]) -- "HTTPS (*.tunnel.com)" --> Nginx[Nginx SSL]
+    Nginx -- "HTTP (:80)" --> Gateway[Gateway Public Port]
+    Gateway <--> Agent[Local Agent]
+    Gateway -- "Control Plane (:9000)" --> UI[Embedded Web UI]
+    Gateway -- "Control Plane (:9000)" --> API[Control Plane API]
+    Agent -- "Fetch" --> Local[Local HTTP Service]
+    Gateway <--> Redis[(Redis Optional)]
 ```
 
-## Default Ports
+---
 
-- Public traffic: `:80`
-- Control plane and Web UI: `:9000`
+## 🚦 Getting Started
 
-## Deploy
+### 1. Local Development
 
-### Option 1: Local deploy
-
-Run the gateway:
+#### Start the Gateway
+The gateway manages the control plane and handles incoming public traffic.
 
 ```bash
 go run ./gateway
 ```
 
-Run the agent on the machine that can reach your local app:
+#### Run the Agent
+The agent connects your local service to the gateway.
 
 ```bash
-AGENT_ID=my-agent \
-SUBDOMAIN=bar-meet-app \
-LOCAL_HOST=http://127.0.0.1:8080 \
-GATEWAY_WS=ws://127.0.0.1:9000/agent/connect \
+# Set your environment variables
+export AGENT_ID="my-local-agent"
+export SUBDOMAIN="my-awesome-app"
+export LOCAL_HOST="http://127.0.0.1:8080"
+export GATEWAY_WS="ws://127.0.0.1:9000/agent/connect"
+
 go run ./agent
 ```
 
-Open the control UI:
+### 2. Docker Deployment
 
-```text
-http://127.0.0.1:9000/ui
-```
-
-### Option 2: Docker deploy
-
-Start the infrastructure:
+Start the entire stack (Gateway + Redis + Nginx) with one command:
 
 ```bash
 docker compose up --build
 ```
 
-What starts:
+> [!IMPORTANT]
+> **Nginx with SSL**: Ensure you have valid certificate files at `./certs/fullchain.pem` and `./certs/privkey.pem` before starting Nginx.
 
-- `gateway` on `:80` and `:9000`
-- `redis` on `:6379`
-- `nginx` on `:443`
+---
 
-Important notes:
+## 🔧 Configuration
 
-- `nginx` requires valid cert files in `./certs/fullchain.pem` and `./certs/privkey.pem`
-- the agent still runs outside the Compose stack unless you add it as another service
-- if you only want the gateway and Redis, you can run `docker compose up --build gateway redis`
+### Gateway Environment Variables
 
-### Production deployment notes
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `PUBLIC_ADDR` | `:80` | Port for incoming public HTTP traffic. |
+| `CONTROL_ADDR` | `:9000` | Port for the control plane (Agent connection + API + UI). |
+| `REDIS_URL` | `localhost:6379` | Redis address for persistent tunnel registration. |
 
-- Point your wildcard DNS, for example `*.tunnel.example.com`, to the gateway host.
-- Put TLS in front of the public port with nginx, Caddy, or a load balancer.
-- Expose the control port only to trusted users. The current Web UI and API do not have authentication yet.
-- Redis is optional in the current single-node setup, but useful if you want tunnel registration state outside process memory.
+### Agent Environment Variables
 
-## Test
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `AGENT_ID` | `hostname-pid` | Unique identifier for your agent. |
+| `SUBDOMAIN` | `bar-meet-app` | The public subdomain requested (e.g., `app.tunnel.com`). |
+| `LOCAL_HOST` | `http://localhost:8080` | The address of your local HTTP service. |
+| `GATEWAY_WS` | `ws://localhost:9000/...` | The WebSocket URL of the gateway control plane. |
 
-### 1. Start a local HTTP app
+---
 
-```bash
-python3 - <<'PY'
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import json
+## 🛠️ Testing Traffic
 
-class Handler(BaseHTTPRequestHandler):
-    def _send(self):
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        body = self.rfile.read(length) if length else b""
-        payload = {
-            "method": self.command,
-            "path": self.path,
-            "body": body.decode("utf-8", "replace"),
-            "forwarded_host": self.headers.get("X-Forwarded-Host"),
-            "replay_of": self.headers.get("X-Bar-Meet-Replay-Of"),
-        }
-        data = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    do_GET = _send
-    do_POST = _send
-
-HTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
-PY
-```
-
-Or run your own app on `http://127.0.0.1:8080`.
-
-### 2. Start the gateway
+### 1. Start a mock server
 
 ```bash
-go run ./gateway
+python3 -c "from http.server import BaseHTTPRequestHandler, HTTPServer; import json; [type('H', (BaseHTTPRequestHandler,), {'do_GET': lambda s: (s.send_response(200), s.send_header('Content-Type', 'application/json'), s.end_headers(), s.wfile.write(json.dumps({'status':'ok', 'path':s.path}).encode())), 'do_POST': lambda s: (s.send_response(200), s.send_header('Content-Type', 'application/json'), s.end_headers(), s.wfile.write(json.dumps({'status':'received', 'body':s.rfile.read(int(s.headers.get('Content-Length',0))).decode('utf-8')}).encode()))})(('127.0.0.1', 8080), H).serve_forever()]"
 ```
 
-### 3. Start the agent
+### 2. Send traffic through the Gateway
 
 ```bash
-AGENT_ID=my-agent \
-SUBDOMAIN=bar-meet-app \
-LOCAL_HOST=http://127.0.0.1:8080 \
-GATEWAY_WS=ws://127.0.0.1:9000/agent/connect \
-go run ./agent
+curl -H 'Host: my-awesome-app.tunnel.com' http://127.0.0.1/hello
 ```
 
-### 4. Send traffic through the tunnel
+### 3. Deep Inspect in UI
 
-```bash
-curl -H 'Host: bar-meet-app.tunnel.com' http://127.0.0.1/hello
-```
+Open **[http://127.0.0.1:9000/ui](http://127.0.0.1:9000/ui)** to:
+- See active agent sessions and throughput.
+- Inspect request/response headers and JSON/HTML/Text bodies.
+- Trigger **Request Replay** for debugging.
 
-If you want to test a POST request:
+---
 
-```bash
-curl \
-  -X POST \
-  -H 'Host: bar-meet-app.tunnel.com' \
-  -H 'Content-Type: application/json' \
-  -d '{"ping":"pong"}' \
-  http://127.0.0.1/api/test
-```
+## 📡 Control Plane API
 
-### 5. Inspect in the Web UI
+| Endpoint | Method | Description |
+| :--- | :--- | :--- |
+| `/api/tunnels` | `GET` | Lists all active agent connections and stats. |
+| `/api/requests` | `GET` | Lists captured traffic records (filtered by `?tunnel=subdomain`). |
+| `/api/requests/:id` | `GET` | Returns full details of a specific traffic record. |
+| `/api/requests/:id/replay` | `POST` | Replays the specified request against the active agent. |
+| `/healthz` | `GET` | Liveness and readiness probe. |
 
-Open:
+---
 
-```text
-http://127.0.0.1:9000/ui
-```
+## 🔒 Proxy Headers
 
-You should see:
+The agent injects the following headers into requests forwarded to your local service:
 
-- the active tunnel in the left panel
-- captured traffic logs in the center panel
-- request and response details in the inspector
+| Header | Description |
+| :--- | :--- |
+| `X-Forwarded-For` | The public IP address of the original client. |
+| `X-Forwarded-Host` | The original `Host` header sent by the client. |
+| `X-Tunnel-Subdomain` | The subdomain assigned to this tunnel. |
+| `X-Bar-Meet-Replay-Of` | Only present on replayed requests, contains the original request ID. |
 
-### 6. Replay a request
+---
 
-Use either the replay button in the UI or the API directly:
+## 📝 Operating Limits
 
-```bash
-curl -X POST http://127.0.0.1:9000/api/requests/req-1/replay
-```
+- **Body Size**: Requests and response bodies are capped at **10 MiB**.
+- **History Retention**: Traffic logs are kept in-memory, capped at the latest **250 records**.
+- **Timeout**: Agent communication times out after **60 seconds**.
+- **Persistence**: If Redis is unavailable, the system automatically falls back to **in-memory** session tracking.
 
-This creates a new traffic record linked to the original request through `replay_of`.
+---
 
-### 7. Verify the API directly
+## 📜 License
 
-List active tunnels:
-
-```bash
-curl http://127.0.0.1:9000/api/tunnels
-```
-
-List captured requests:
-
-```bash
-curl http://127.0.0.1:9000/api/requests
-```
-
-Fetch one request:
-
-```bash
-curl http://127.0.0.1:9000/api/requests/req-1
-```
-
-### 8. Run build and test checks
-
-```bash
-go test ./...
-go build ./...
-```
-
-## Environment Variables
-
-Gateway:
-
-- `PUBLIC_ADDR` default `:80`
-- `CONTROL_ADDR` default `:9000`
-- `REDIS_URL` default `localhost:6379`
-
-Agent:
-
-- `AGENT_ID`
-- `SUBDOMAIN`
-- `LOCAL_HOST`
-- `GATEWAY_WS`
-
-## Notes
-
-- Redis is optional for the current single-node setup. If Redis is unavailable, the gateway falls back to in-memory session tracking.
-- Traffic capture is currently in-memory only. Restarting the gateway clears the request history.
-- Request and response bodies are capped at `10 MiB` per exchange.
-
-## Docker
-
-The gateway Dockerfile builds the current Go codebase. The included `docker-compose.yml` still wires Redis and nginx, but you need valid TLS certs under `./certs` before nginx can start.
-
-## License
-
-MIT
+Distributed under the **MIT** License. See `LICENSE` for more information.
