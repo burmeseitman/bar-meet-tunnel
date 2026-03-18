@@ -1,0 +1,19 @@
+# Go
+/bin
+/obj
+/out
+/vendor
+*.exe
+*.test
+*.prof
+
+# Docker
+.DS_Store
+*.log
+*.tmp
+*.bak
+
+# IDEs
+.vscode/
+.idea/
+.env
