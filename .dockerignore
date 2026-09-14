@@ -1,0 +1,13 @@
+# Use an allowlist: credentials, certificates, Git data and local artifacts
+# never enter the Docker build context.
+**
+!go.mod
+!go.sum
+!gateway/
+!gateway/*.go
+!gateway/ui/
+!gateway/ui/index.html
+!gateway/Dockerfile
+!internal/
+!internal/protocol/
+!internal/protocol/*.go

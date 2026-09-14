@@ -3,12 +3,14 @@ package protocol
 import "time"
 
 const (
+	MessageTypeCancel        = "cancel"
 	MessageTypeHello         = "hello"
 	MessageTypeProxyRequest  = "proxy_request"
 	MessageTypeProxyResponse = "proxy_response"
 )
 
 type Message struct {
+	CancelID string         `json:"cancel_id,omitempty"`
 	Type     string         `json:"type"`
 	Hello    *Hello         `json:"hello,omitempty"`
 	Request  *ProxyRequest  `json:"request,omitempty"`

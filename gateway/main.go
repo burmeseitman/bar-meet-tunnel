@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -12,11 +13,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -26,15 +30,18 @@ import (
 )
 
 const (
-	defaultPublicAddr  = ":80"
-	defaultControlAddr = ":9000"
-	requestTimeout     = 60 * time.Second
-	maxBodyBytes       = 10 << 20
-	maxTrafficRecords  = 250
-	redisTunnelTTL     = 90 * time.Second
+	defaultPublicAddr     = ":80"
+	defaultControlAddr    = "127.0.0.1:9000"
+	defaultRequestTimeout = 60 * time.Second
+	maxHistoryBytes       = 64 << 20
+	maxConcurrentRequests = 32
+	maxBodyBytes          = 10 << 20
+	maxTrafficRecords     = 250
+	redisTunnelTTL        = 90 * time.Second
 )
 
 var (
+	errTunnelBusy  = errors.New("tunnel busy")
 	validSubdomain = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 	hopByHopHeader = map[string]struct{}{
 		"Connection":          {},
@@ -47,7 +54,7 @@ var (
 		"Upgrade":             {},
 	}
 	websocketUpgrader = websocket.Upgrader{
-		CheckOrigin: func(_ *http.Request) bool { return true },
+		CheckOrigin: func(r *http.Request) bool { return r.Header.Get("Origin") == "" },
 	}
 )
 
@@ -55,7 +62,17 @@ var (
 var uiFS embed.FS
 
 type Gateway struct {
-	redisClient *redis.Client
+	redisClient    *redis.Client
+	controlToken   string
+	agentTokens    map[string]string
+	trustedProxies []*net.IPNet
+	timeout        time.Duration
+	slots          chan struct{}
+	historyBytes   int64
+	captureMode    string
+	captureTTL     time.Duration
+	redactExtra    []string
+	clients        clientLimiter
 
 	mu                  sync.RWMutex
 	sessionsBySubdomain map[string]*AgentSession
@@ -73,6 +90,7 @@ type AgentSession struct {
 	agentID   string
 	subdomain string
 	localHost string
+	slots     chan struct{}
 
 	connectedAt time.Time
 	lastSeenNS  atomic.Int64
@@ -100,6 +118,8 @@ type RequestSnapshot struct {
 }
 
 type TrafficRecord struct {
+	Replayable      bool
+	ExpiresAt       time.Time
 	ID              string
 	Tunnel          string
 	AgentID         string
@@ -128,6 +148,7 @@ type BodyView struct {
 }
 
 type TrafficRecordView struct {
+	Replayable      bool                `json:"replayable"`
 	ID              string              `json:"id"`
 	Tunnel          string              `json:"tunnel"`
 	AgentID         string              `json:"agent_id"`
@@ -161,6 +182,7 @@ type TunnelView struct {
 
 func main() {
 	gateway := newGateway()
+	gateway.loadConfig()
 
 	controlMux := http.NewServeMux()
 	controlMux.HandleFunc("/agent/connect", gateway.handleAgentConnect)
@@ -173,25 +195,40 @@ func main() {
 	publicMux := http.NewServeMux()
 	publicMux.HandleFunc("/", gateway.handlePublicRequest)
 
-	go func() {
-		addr := envOrDefault("CONTROL_ADDR", defaultControlAddr)
-		server := &http.Server{
-			Addr:              addr,
-			Handler:           controlMux,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		log.Printf("control server listening on %s", addr)
-		log.Fatal(server.ListenAndServe())
-	}()
-
-	addr := envOrDefault("PUBLIC_ADDR", defaultPublicAddr)
-	server := &http.Server{
-		Addr:              addr,
-		Handler:           publicMux,
-		ReadHeaderTimeout: 10 * time.Second,
+	control := &http.Server{Addr: envOrDefault("CONTROL_ADDR", defaultControlAddr), Handler: gateway.controlHandler(controlMux), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: gateway.timeout, WriteTimeout: 2*gateway.timeout + 15*time.Second, IdleTimeout: 60 * time.Second}
+	public := &http.Server{Addr: envOrDefault("PUBLIC_ADDR", defaultPublicAddr), Handler: publicMux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: gateway.timeout, WriteTimeout: 2*gateway.timeout + 15*time.Second, IdleTimeout: 60 * time.Second}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go gateway.expireTrafficLoop(ctx)
+	failures := make(chan error, 2)
+	for _, server := range []*http.Server{control, public} {
+		go func() { log.Printf("listening on %s", server.Addr); failures <- server.ListenAndServe() }()
 	}
-	log.Printf("public server listening on %s", addr)
-	log.Fatal(server.ListenAndServe())
+	select {
+	case <-ctx.Done():
+	case err := <-failures:
+		log.Printf("server stopped: %v", err)
+	}
+	gateway.mu.RLock()
+	sessions := make([]*AgentSession, 0, len(gateway.sessionsBySubdomain))
+	for _, session := range gateway.sessionsBySubdomain {
+		sessions = append(sessions, session)
+	}
+	gateway.mu.RUnlock()
+	for _, session := range sessions {
+		session.close(websocket.CloseGoingAway, "gateway shutdown")
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, server := range []*http.Server{control, public} {
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+		}
+	}
+	if gateway.redisClient != nil {
+		_ = gateway.redisClient.Close()
+	}
+
 }
 
 func newGateway() *Gateway {
@@ -199,6 +236,10 @@ func newGateway() *Gateway {
 		sessionsBySubdomain: make(map[string]*AgentSession),
 		sessionsByAgentID:   make(map[string]*AgentSession),
 		trafficByID:         make(map[string]*TrafficRecord),
+		timeout:             defaultRequestTimeout,
+		captureMode:         "metadata",
+		captureTTL:          15 * time.Minute,
+		slots:               make(chan struct{}, maxConcurrentRequests),
 	}
 
 	redisAddr := strings.TrimSpace(os.Getenv("REDIS_URL"))
@@ -210,6 +251,7 @@ func newGateway() *Gateway {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
 		log.Printf("redis unavailable at %s: %v; continuing with in-memory registry", redisAddr, err)
 		return gateway
 	}
@@ -220,13 +262,18 @@ func newGateway() *Gateway {
 }
 
 func (g *Gateway) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
+	subdomain := r.URL.Query().Get("subdomain")
+	if !validSubdomain.MatchString(subdomain) || !tokenEqual(bearerToken(r), g.agentTokens[subdomain]) {
+		http.Error(w, "unauthorized agent", http.StatusUnauthorized)
+		return
+	}
 	conn, err := websocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("agent websocket upgrade failed: %v", err)
 		return
 	}
 
-	conn.SetReadLimit(maxBodyBytes*2 + (1 << 20))
+	conn.SetReadLimit(4096)
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	var hello protocol.Message
@@ -246,7 +293,7 @@ func (g *Gateway) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validSubdomain.MatchString(hello.Hello.Subdomain) || hello.Hello.AgentID == "" {
+	if !validSubdomain.MatchString(hello.Hello.Subdomain) || hello.Hello.AgentID == "" || hello.Hello.Subdomain != subdomain {
 		_ = conn.WriteControl(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "invalid agent metadata"),
@@ -256,6 +303,7 @@ func (g *Gateway) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	conn.SetReadLimit(maxBodyBytes*2 + (1 << 20))
 	session := &AgentSession{
 		gateway:     g,
 		conn:        conn,
@@ -265,6 +313,7 @@ func (g *Gateway) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 		connectedAt: time.Now().UTC(),
 		pending:     make(map[string]chan *protocol.ProxyResponse),
 		closed:      make(chan struct{}),
+		slots:       make(chan struct{}, 8),
 	}
 	session.touch()
 
@@ -274,7 +323,10 @@ func (g *Gateway) handleAgentConnect(w http.ResponseWriter, r *http.Request) {
 	})
 	_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 
-	g.registerSession(session)
+	if !g.registerSession(session) {
+		session.close(websocket.ClosePolicyViolation, "subdomain or agent ID already connected")
+		return
+	}
 	defer g.unregisterSession(session)
 
 	log.Printf("agent connected: %s (%s -> %s)", session.agentID, session.subdomain, session.localHost)
@@ -334,6 +386,7 @@ func (g *Gateway) handleAPITunnels(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (g *Gateway) handleAPIRequests(w http.ResponseWriter, r *http.Request) {
+	g.expireTraffic(time.Now())
 	filterTunnel := strings.TrimSpace(r.URL.Query().Get("tunnel"))
 
 	g.mu.RLock()
@@ -346,7 +399,7 @@ func (g *Gateway) handleAPIRequests(w http.ResponseWriter, r *http.Request) {
 		if filterTunnel != "" && record.Tunnel != filterTunnel {
 			continue
 		}
-		records = append(records, record.view())
+		records = append(records, g.trafficView(record))
 	}
 	g.mu.RUnlock()
 
@@ -368,7 +421,7 @@ func (g *Gateway) handleAPIRequestByID(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		g.writeJSON(w, http.StatusOK, record.view())
+		g.writeJSON(w, http.StatusOK, g.trafficView(record))
 		return
 	}
 
@@ -379,13 +432,23 @@ func (g *Gateway) handleAPIRequestByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if !record.Replayable {
+			http.Error(w, "replay requires full traffic capture", http.StatusConflict)
+			return
+		}
 		session, ok := g.lookupSession(record.Tunnel)
 		if !ok {
 			http.Error(w, "tunnel is not active", http.StatusConflict)
 			return
 		}
 
-		replayed, _, err := g.dispatchRequest(session, RequestSnapshot{
+		release, err := g.admit(session)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
+		replayed, _, err := g.dispatchAdmitted(r.Context(), session, RequestSnapshot{
 			Method:     record.Method,
 			Path:       record.Path,
 			RawQuery:   record.RawQuery,
@@ -396,11 +459,11 @@ func (g *Gateway) handleAPIRequestByID(w http.ResponseWriter, r *http.Request) {
 			ReplayOf:   record.ID,
 		})
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, err.Error(), proxyErrorStatus(err))
 			return
 		}
 
-		g.writeJSON(w, http.StatusOK, replayed.view())
+		g.writeJSON(w, http.StatusOK, g.trafficView(replayed))
 		return
 	}
 
@@ -408,6 +471,13 @@ func (g *Gateway) handleAPIRequestByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) handlePublicRequest(w http.ResponseWriter, r *http.Request) {
+	releaseIP, ok := g.clients.admit("public:"+g.clientAddress(r), time.Now(), true)
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "client rate or concurrency limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+	defer releaseIP()
 	subdomain, ok := extractSubdomain(r.Host)
 	if !ok {
 		http.Error(w, "invalid host", http.StatusBadRequest)
@@ -420,23 +490,29 @@ func (g *Gateway) handlePublicRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, err := g.admit(session)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
 	body, err := readBody(r.Body, maxBodyBytes)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
 
-	record, response, err := g.dispatchRequest(session, RequestSnapshot{
+	record, response, err := g.dispatchAdmitted(r.Context(), session, RequestSnapshot{
 		Method:     r.Method,
 		Path:       requestPath(r),
 		RawQuery:   r.URL.RawQuery,
 		Host:       r.Host,
-		RemoteAddr: clientAddress(r),
+		RemoteAddr: g.clientAddress(r),
 		Headers:    filterHeaders(r.Header),
 		Body:       body,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), proxyErrorStatus(err))
 		return
 	}
 
@@ -452,7 +528,20 @@ func (g *Gateway) handlePublicRequest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *Gateway) dispatchRequest(session *AgentSession, snapshot RequestSnapshot) (*TrafficRecord, *protocol.ProxyResponse, error) {
+func (g *Gateway) dispatchRequest(ctx context.Context, session *AgentSession, snapshot RequestSnapshot) (*TrafficRecord, *protocol.ProxyResponse, error) {
+	release, err := g.admit(session)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+	return g.dispatchAdmitted(ctx, session, snapshot)
+}
+func (g *Gateway) dispatchAdmitted(ctx context.Context, session *AgentSession, snapshot RequestSnapshot) (*TrafficRecord, *protocol.ProxyResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, g.timeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	requestID := g.nextID("req")
 	startedAt := time.Now().UTC()
 	msg := &protocol.ProxyRequest{
@@ -492,15 +581,16 @@ func (g *Gateway) dispatchRequest(session *AgentSession, snapshot RequestSnapsho
 			CompletedAt: time.Now().UTC(),
 		}, startedAt)
 		return record, nil, errors.New(record.Error)
-	case <-time.After(requestTimeout):
+	case <-ctx.Done():
+		_ = session.sendMessage(protocol.Message{Type: protocol.MessageTypeCancel, CancelID: requestID})
 		session.takePending(requestID)
 		record := g.recordTraffic(session, snapshot, &protocol.ProxyResponse{
 			ID:          requestID,
 			StatusCode:  http.StatusGatewayTimeout,
-			Error:       "agent response timed out",
+			Error:       ctx.Err().Error(),
 			CompletedAt: time.Now().UTC(),
 		}, startedAt)
-		return record, nil, errors.New(record.Error)
+		return record, nil, ctx.Err()
 	}
 
 	if response == nil {
@@ -513,6 +603,9 @@ func (g *Gateway) dispatchRequest(session *AgentSession, snapshot RequestSnapsho
 		return record, nil, errors.New(record.Error)
 	}
 
+	if response.StatusCode < 200 || response.StatusCode > 599 || len(response.Body) > maxBodyBytes {
+		response = &protocol.ProxyResponse{ID: requestID, StatusCode: http.StatusBadGateway, Error: "invalid agent response"}
+	}
 	record := g.recordTraffic(session, snapshot, response, startedAt)
 	session.requests.Add(1)
 	session.bytesIn.Add(uint64(len(snapshot.Body)))
@@ -527,32 +620,46 @@ func (g *Gateway) recordTraffic(session *AgentSession, snapshot RequestSnapshot,
 	}
 
 	record := &TrafficRecord{
-		ID:              response.ID,
-		Tunnel:          session.subdomain,
-		AgentID:         session.agentID,
-		Method:          snapshot.Method,
-		Path:            snapshot.Path,
-		RawQuery:        snapshot.RawQuery,
-		Host:            snapshot.Host,
-		RemoteAddr:      snapshot.RemoteAddr,
-		StatusCode:      response.StatusCode,
-		Error:           response.Error,
-		DurationMS:      durationMillis(startedAt, completedAt, response.DurationMS),
-		StartedAt:       startedAt,
-		CompletedAt:     completedAt,
-		RequestHeaders:  cloneHeaderMap(snapshot.Headers),
-		ResponseHeaders: cloneHeaderMap(response.Headers),
-		RequestBody:     append([]byte(nil), snapshot.Body...),
-		ResponseBody:    append([]byte(nil), response.Body...),
-		ReplayOf:        snapshot.ReplayOf,
+		ID:          response.ID,
+		Tunnel:      session.subdomain,
+		AgentID:     session.agentID,
+		Method:      snapshot.Method,
+		Path:        snapshot.Path,
+		RawQuery:    snapshot.RawQuery,
+		Host:        snapshot.Host,
+		RemoteAddr:  snapshot.RemoteAddr,
+		StatusCode:  response.StatusCode,
+		Error:       response.Error,
+		DurationMS:  durationMillis(startedAt, completedAt, response.DurationMS),
+		StartedAt:   startedAt,
+		CompletedAt: completedAt,
+
+		ReplayOf: snapshot.ReplayOf,
 	}
 
+	if g.captureMode == "off" {
+		return record
+	}
+	record.ExpiresAt = time.Now().Add(g.captureTTL)
+	record.RequestHeaders = g.redactHeaders(snapshot.Headers)
+	record.ResponseHeaders = g.redactHeaders(response.Headers)
+	record.RawQuery = ""
+	if g.captureMode == "full" {
+		record.Replayable = true
+		record.RawQuery = snapshot.RawQuery
+		record.RequestHeaders = cloneHeaderMap(snapshot.Headers)
+		record.ResponseHeaders = cloneHeaderMap(response.Headers)
+		record.RequestBody = append([]byte(nil), snapshot.Body...)
+		record.ResponseBody = append([]byte(nil), response.Body...)
+	}
 	g.mu.Lock()
 	g.trafficByID[record.ID] = record
 	g.trafficOrder = append(g.trafficOrder, record.ID)
-	for len(g.trafficOrder) > maxTrafficRecords {
+	g.historyBytes += trafficSize(record)
+	for len(g.trafficOrder) > maxTrafficRecords || g.historyBytes > maxHistoryBytes {
 		oldestID := g.trafficOrder[0]
 		g.trafficOrder = g.trafficOrder[1:]
+		g.historyBytes -= trafficSize(g.trafficByID[oldestID])
 		delete(g.trafficByID, oldestID)
 	}
 	g.mu.Unlock()
@@ -560,29 +667,17 @@ func (g *Gateway) recordTraffic(session *AgentSession, snapshot RequestSnapshot,
 	return record
 }
 
-func (g *Gateway) registerSession(session *AgentSession) {
-	var toClose []*AgentSession
-	toCloseSet := make(map[*AgentSession]struct{})
-
+func (g *Gateway) registerSession(session *AgentSession) bool {
 	g.mu.Lock()
-	if existing := g.sessionsBySubdomain[session.subdomain]; existing != nil && existing != session {
-		toCloseSet[existing] = struct{}{}
-	}
-	if existing := g.sessionsByAgentID[session.agentID]; existing != nil && existing != session {
-		toCloseSet[existing] = struct{}{}
+	if g.sessionsBySubdomain[session.subdomain] != nil || g.sessionsByAgentID[session.agentID] != nil {
+		g.mu.Unlock()
+		return false
 	}
 	g.sessionsBySubdomain[session.subdomain] = session
 	g.sessionsByAgentID[session.agentID] = session
 	g.mu.Unlock()
-
-	for existing := range toCloseSet {
-		toClose = append(toClose, existing)
-	}
-	for _, existing := range toClose {
-		existing.close(websocket.CloseNormalClosure, "replaced by newer session")
-	}
-
 	g.refreshRedis(session)
+	return true
 }
 
 func (g *Gateway) unregisterSession(session *AgentSession) {
@@ -614,6 +709,7 @@ func (g *Gateway) lookupSession(subdomain string) (*AgentSession, bool) {
 }
 
 func (g *Gateway) getTraffic(id string) (*TrafficRecord, bool) {
+	g.expireTraffic(time.Now())
 	g.mu.RLock()
 	record, ok := g.trafficByID[id]
 	g.mu.RUnlock()
@@ -627,7 +723,7 @@ func (g *Gateway) refreshRedis(session *AgentSession) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := g.redisClient.Set(ctx, redisKey(session.subdomain), session.agentID, redisTunnelTTL).Err(); err != nil {
+	if err := g.redisClient.Set(ctx, redisKey(session.subdomain), session.redisLease(), redisTunnelTTL).Err(); err != nil {
 		log.Printf("redis set failed for %s: %v", session.subdomain, err)
 	}
 }
@@ -640,12 +736,12 @@ func (g *Gateway) removeRedis(session *AgentSession) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	value, err := g.redisClient.Get(ctx, redisKey(session.subdomain)).Result()
-	if err == nil && value == session.agentID {
-		if err := g.redisClient.Del(ctx, redisKey(session.subdomain)).Err(); err != nil {
-			log.Printf("redis delete failed for %s: %v", session.subdomain, err)
-		}
+	// Compare and delete atomically so an old disconnect cannot erase a new lease.
+	script := redis.NewScript(`if redis.call("GET", KEYS[1]) == ARGV[1] then return redis.call("DEL", KEYS[1]) else return 0 end`)
+	if err := script.Run(ctx, g.redisClient, []string{redisKey(session.subdomain)}, session.redisLease()).Err(); err != nil {
+		log.Printf("redis delete failed for %s: %v", session.subdomain, err)
 	}
+
 }
 
 func (g *Gateway) nextID(prefix string) string {
@@ -681,9 +777,10 @@ func (s *AgentSession) pingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.sendMu.Lock()
-			_ = s.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
-			s.sendMu.Unlock()
+			if err := s.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second)); err != nil {
+				s.close(websocket.CloseGoingAway, "ping failed")
+				return
+			}
 		case <-s.closed:
 			return
 		}
@@ -715,14 +812,15 @@ func (s *AgentSession) readLoop() {
 }
 
 func (s *AgentSession) sendRequest(request *protocol.ProxyRequest) error {
+	return s.sendMessage(protocol.Message{Type: protocol.MessageTypeProxyRequest, Request: request})
+}
+
+func (s *AgentSession) sendMessage(msg protocol.Message) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
 	_ = s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return s.conn.WriteJSON(protocol.Message{
-		Type:    protocol.MessageTypeProxyRequest,
-		Request: request,
-	})
+	return s.conn.WriteJSON(msg)
 }
 
 func (s *AgentSession) registerPending(id string) chan *protocol.ProxyResponse {
@@ -759,9 +857,7 @@ func (s *AgentSession) close(code int, text string) {
 		close(s.closed)
 		s.failPending(errors.New("agent disconnected"))
 
-		s.sendMu.Lock()
 		_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, text), time.Now().Add(time.Second))
-		s.sendMu.Unlock()
 		_ = s.conn.Close()
 	})
 }
@@ -783,6 +879,7 @@ func (s *AgentSession) failPending(err error) {
 
 func (r *TrafficRecord) view() TrafficRecordView {
 	return TrafficRecordView{
+		Replayable:      r.Replayable,
 		ID:              r.ID,
 		Tunnel:          r.Tunnel,
 		AgentID:         r.AgentID,
@@ -796,8 +893,8 @@ func (r *TrafficRecord) view() TrafficRecordView {
 		DurationMS:      r.DurationMS,
 		StartedAt:       r.StartedAt,
 		CompletedAt:     r.CompletedAt,
-		RequestHeaders:  cloneHeaderMap(r.RequestHeaders),
-		ResponseHeaders: cloneHeaderMap(r.ResponseHeaders),
+		RequestHeaders:  redactHeaders(r.RequestHeaders),
+		ResponseHeaders: redactHeaders(r.ResponseHeaders),
 		RequestBody:     previewBody(r.RequestBody),
 		ResponseBody:    previewBody(r.ResponseBody),
 		ReplayOf:        r.ReplayOf,
@@ -876,23 +973,52 @@ func requestPath(r *http.Request) string {
 	if r.URL.Path == "" {
 		return "/"
 	}
-	return r.URL.Path
+	return r.URL.EscapedPath()
 }
 
-func clientAddress(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		return strings.TrimSpace(parts[0])
+func (g *Gateway) clientAddress(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		peer = r.RemoteAddr
 	}
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
+	trusted := func(value string) bool {
+		ip := net.ParseIP(value)
+		for _, network := range g.trustedProxies {
+			if network.Contains(ip) {
+				return true
+			}
+		}
+		return false
 	}
-	return r.RemoteAddr
+	if !trusted(peer) {
+		return peer
+	}
+	chain := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+	for i := len(chain) - 1; i >= 0; i-- {
+		candidate := strings.TrimSpace(chain[i])
+		if net.ParseIP(candidate) == nil {
+			return peer
+		}
+		peer = candidate
+		if !trusted(peer) {
+			break
+		}
+	}
+	return peer
 }
 
 func filterHeaders(headers http.Header) map[string][]string {
 	cloned := make(map[string][]string, len(headers))
+	nominated := make(map[string]bool)
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			nominated[http.CanonicalHeaderKey(strings.TrimSpace(name))] = true
+		}
+	}
 	for key, values := range headers {
+		if nominated[http.CanonicalHeaderKey(key)] {
+			continue
+		}
 		if _, skip := hopByHopHeader[http.CanonicalHeaderKey(key)]; skip {
 			continue
 		}
@@ -902,7 +1028,7 @@ func filterHeaders(headers http.Header) map[string][]string {
 }
 
 func applyHeaders(dst http.Header, src map[string][]string) {
-	for key, values := range src {
+	for key, values := range filterHeaders(http.Header(src)) {
 		if _, skip := hopByHopHeader[http.CanonicalHeaderKey(key)]; skip {
 			continue
 		}
@@ -939,4 +1065,135 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func tokenEqual(got, want string) bool {
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+func bearerToken(r *http.Request) string {
+	value, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return ""
+	}
+	return value
+}
+func (g *Gateway) loadConfig() {
+	g.captureMode = envOrDefault("CAPTURE_MODE", "metadata")
+	if g.captureMode != "off" && g.captureMode != "metadata" && g.captureMode != "full" {
+		log.Fatal("CAPTURE_MODE must be off, metadata, or full")
+	}
+	ttl, err := time.ParseDuration(envOrDefault("CAPTURE_TTL", "15m"))
+	if err != nil || ttl < time.Second || ttl > 24*time.Hour {
+		log.Fatal("CAPTURE_TTL must be between 1s and 24h")
+	}
+	g.captureTTL = ttl
+	for _, name := range strings.Split(os.Getenv("REDACT_HEADERS"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			g.redactExtra = append(g.redactExtra, name)
+		}
+	}
+	g.controlToken = os.Getenv("CONTROL_TOKEN")
+	if len(g.controlToken) < 32 {
+		log.Fatal("CONTROL_TOKEN must contain at least 32 characters")
+	}
+	if err := json.Unmarshal([]byte(os.Getenv("AGENT_TOKENS")), &g.agentTokens); err != nil || len(g.agentTokens) == 0 {
+		log.Fatal("AGENT_TOKENS must be a JSON object mapping subdomains to tokens")
+	}
+	for subdomain, token := range g.agentTokens {
+		if !validSubdomain.MatchString(subdomain) || len(token) < 32 {
+			log.Fatal("AGENT_TOKENS requires valid subdomains and tokens of at least 32 characters")
+		}
+	}
+	if value := os.Getenv("REQUEST_TIMEOUT_SECONDS"); value != "" {
+		seconds, err := strconv.Atoi(value)
+		if err != nil || seconds < 1 || seconds > 300 {
+			log.Fatal("REQUEST_TIMEOUT_SECONDS must be between 1 and 300")
+		}
+		g.timeout = time.Duration(seconds) * time.Second
+	}
+	for _, value := range strings.Split(os.Getenv("TRUSTED_PROXY_CIDRS"), ",") {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(strings.TrimSpace(value))
+		if err != nil {
+			log.Fatal("invalid TRUSTED_PROXY_CIDRS")
+		}
+		g.trustedProxies = append(g.trustedProxies, network)
+	}
+}
+func (g *Gateway) controlHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			if !g.secureControlRequest(r) {
+				http.Error(w, "remote control access requires HTTPS", http.StatusUpgradeRequired)
+				return
+			}
+			release, ok := g.clients.admit("control:"+g.clientAddress(r), time.Now(), false)
+			if !ok {
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+			defer release()
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		if r.URL.Path == "/agent/connect" || r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := bearerToken(r)
+		if _, password, ok := r.BasicAuth(); ok {
+			token = password
+		}
+		if !tokenEqual(token, g.controlToken) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Tunnel administrator", charset="UTF-8"`)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if origin := r.Header.Get("Origin"); origin != "" && origin != "https://"+r.Host && origin != "http://"+r.Host {
+				http.Error(w, "invalid origin", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+func redactHeaders(headers map[string][]string) map[string][]string {
+	result := cloneHeaderMap(headers)
+	for key := range result {
+		switch strings.ToLower(key) {
+		case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key":
+			result[key] = []string{"[REDACTED]"}
+		}
+	}
+	return result
+}
+func trafficSize(record *TrafficRecord) int64 {
+	size := len(record.RequestBody) + len(record.ResponseBody) + len(record.Path) + len(record.RawQuery)
+	for _, headers := range []map[string][]string{record.RequestHeaders, record.ResponseHeaders} {
+		for key, values := range headers {
+			size += len(key)
+			for _, value := range values {
+				size += len(value)
+			}
+		}
+	}
+	return int64(size)
+}
+
+func proxyErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	if errors.Is(err, errTunnelBusy) {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+func (s *AgentSession) redisLease() string {
+	return fmt.Sprintf("%s:%d", s.agentID, s.connectedAt.UnixNano())
 }

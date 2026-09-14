@@ -381,6 +381,9 @@
       requests: [],
       selectedRequestId: null,
       selectedTunnel: "",
+ replaying: false,
+ refreshing: false,
+ refreshAgain: false,
     };
 
     const tunnelList = document.getElementById("tunnelList");
@@ -395,10 +398,11 @@
     });
 
     replayButton.addEventListener("click", async () => {
-      if (!state.selectedRequestId) {
+      if (!state.selectedRequestId || state.replaying) {
         return;
       }
-      replayButton.disabled = true;
+      state.replaying = true;
+ replayButton.disabled = true;
       try {
         const response = await fetch(`/api/requests/${state.selectedRequestId}/replay`, { method: "POST" });
         if (!response.ok) {
@@ -412,7 +416,8 @@
       } catch (error) {
         alert(error.message || "Replay failed");
       } finally {
-        replayButton.disabled = false;
+        state.replaying = false;
+ renderDetails();
       }
     });
 
@@ -536,7 +541,8 @@
 
     function renderDetails() {
       const entry = state.requests.find((item) => item.id === state.selectedRequestId);
-      replayButton.disabled = !entry;
+      replayButton.disabled = !entry || !entry.replayable || state.replaying;
+ replayButton.title = entry && !entry.replayable ? "Replay requires full traffic capture" : "Replay captured request";
 
       if (!entry) {
         details.innerHTML = '<div class="empty">Select a traffic entry to inspect request and response data.</div>';
@@ -594,17 +600,27 @@
     }
 
     async function refresh() {
+ if (state.refreshing) { state.refreshAgain = true; return; }
+ state.refreshing = true;
+ const selectedTunnel = state.selectedTunnel;
+ try {
       const [tunnelsResponse, requestsResponse] = await Promise.all([
         fetch("/api/tunnels"),
-        fetch(`/api/requests${state.selectedTunnel ? `?tunnel=${encodeURIComponent(state.selectedTunnel)}` : ""}`),
+        fetch(`/api/requests${selectedTunnel ? `?tunnel=${encodeURIComponent(selectedTunnel)}` : ""}`),
       ]);
 
-      state.tunnels = tunnelsResponse.ok ? await tunnelsResponse.json() : [];
-      state.requests = requestsResponse.ok ? await requestsResponse.json() : [];
+      if (!tunnelsResponse.ok || !requestsResponse.ok) throw new Error("Refresh failed. Check your connection and sign-in.");
+ const tunnels = await tunnelsResponse.json();
+ const requests = await requestsResponse.json();
+ if (selectedTunnel !== state.selectedTunnel) { state.refreshAgain = true; return; }
+ state.tunnels = tunnels;
+ state.requests = requests;
       document.getElementById("lastRefresh").textContent = formatTime(new Date().toISOString());
 
       renderTunnels();
       renderRequests();
+ } catch (error) { document.getElementById("lastRefresh").textContent = "Offline / refresh failed"; }
+ finally { state.refreshing = false; if (state.refreshAgain) { state.refreshAgain = false; void refresh(); } }
     }
 
     refresh();

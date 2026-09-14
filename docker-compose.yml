@@ -1,29 +1,55 @@
 services:
   gateway:
-    build: 
+    build:
       context: .
       dockerfile: gateway/Dockerfile
-    ports:
-      - "80:80"
-      - "9000:9000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
-      - REDIS_URL=redis:6379
+      PUBLIC_ADDR: ':8080'
+      REDIS_URL: redis:6379
+      CONTROL_ADDR: ':9000'
+      CONTROL_TOKEN: ${CONTROL_TOKEN:?Set CONTROL_TOKEN in .env}
+      AGENT_TOKENS: ${AGENT_TOKENS:?Set AGENT_TOKENS in .env}
+      TRUSTED_PROXY_CIDRS: 172.30.0.2/32
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-60}
+      CAPTURE_MODE: ${CAPTURE_MODE:-metadata}
+      CAPTURE_TTL: ${CAPTURE_TTL:-15m}
+      REDACT_HEADERS: ${REDACT_HEADERS:-}
+    networks:
+      - tunnel
 
   redis:
-    image: redis:alpine
-    container_name: bar-meet-redis
-    ports:
-      - "6379:6379"
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - tunnel
 
   nginx:
-    image: nginx:alpine
-    container_name: bar-meet-nginx
+    image: nginx:alpine-slim@sha256:3b171d7224b669faa3cc2137fea0a65301791df1ec1f271ebd2a2b7461f7fade
     ports:
-      - "443:443"
+      - '80:80'
+      - '443:443'
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./certs:/etc/nginx/certs:ro
     depends_on:
       - gateway
+    networks:
+      tunnel:
+        ipv4_address: 172.30.0.2
+
+networks:
+  tunnel:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
